@@ -1,0 +1,513 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!unzip /content/drive/MyDrive/SKNCCR/MILK10k_Training_Input.zip -d /content/vas
+
+# IMPORTS
+import pandas as pd
+import os
+import shutil
+from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import EfficientNetB2
+from tensorflow.keras import layers, models
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
+
+# PATHS
+RAW_IMAGE_DIR = "/content/MILK10k_Training_Input/"  # folder with your images
+DIAG_CSV = "/content/drive/MyDrive/SKNCCR/MILK10k_Training_Supplement.csv"  # diagnosis CSV
+OUTPUT_PATH = "/content/milk10k_cancer_binary/"
+
+# BUILD IMAGE PATH MAPPING
+image_id_to_path = {}
+print("Building image path mapping...")
+for root, _, files in os.walk(RAW_IMAGE_DIR):
+    for file in files:
+        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            isic_id = os.path.splitext(file)[0]
+            image_id_to_path[isic_id] = os.path.join(root, file)
+print(f"Found {len(image_id_to_path)} images.")
+
+# CREATE FOLDER STRUCTURE
+for c in ["cancer", "non_cancer"]:
+    os.makedirs(os.path.join(OUTPUT_PATH, c), exist_ok=True)
+
+# LOAD CSV
+df = pd.read_csv(DIAG_CSV)
+print("Columns:", df.columns.tolist())
+print(df.head())
+
+# Filter only images we actually have
+df = df[df['isic_id'].isin(image_id_to_path.keys())].copy() # .copy() to avoid SettingWithCopyWarning
+print(f"Filtered DataFrame size after matching images: {len(df)}")
+
+# MAP LABELS
+def map_label(row):
+    diagnosis = str(row["diagnosis_full"]).lower()
+    cancer_terms = ["melanoma", "squamous cell carcinoma", "basal cell carcinoma",
+                    "actinic keratosis", "keratoacanthoma", "atypical fibroxanthoma",
+                    "kaposi sarcoma", "malignant peripheral nerve sheath tumor",
+                    "merkel cell carcinoma"]
+    if any(term in diagnosis for term in cancer_terms):
+        return "cancer"
+    else:
+        return "non_cancer"
+
+df['label'] = df.apply(map_label, axis=1) # Assign the labels to a new 'label' column
+print("Labels mapped.")
+print(df['label'].value_counts()) 
+
+# COPY IMAGES TO FOLDER
+print("Copying images to structured folders...")
+for _, row in tqdm(df.iterrows(), total=len(df)):
+    img_id = row["isic_id"]
+    label = row["label"]
+    src = image_id_to_path[img_id] 
+    dst = os.path.join(OUTPUT_PATH, label, img_id + ".jpg")
+    shutil.copy(src, dst)
+print("Image copying complete.")
+
+# Verify
+for root, dirs, files in os.walk(OUTPUT_PATH):
+    print(root, len(files))
+
+# DATA GENERATORS
+train_gen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,
+    horizontal_flip=True,
+    vertical_flip=True
+)
+
+train_data = train_gen.flow_from_directory(
+    OUTPUT_PATH,
+    target_size=(260,260),
+    batch_size=32,
+    class_mode='binary',
+    subset='training'
+)
+
+val_data = train_gen.flow_from_directory(
+    OUTPUT_PATH,
+    target_size=(260,260),
+    batch_size=32,
+    class_mode='binary',
+    subset='validation'
+)
+
+# CLASS WEIGHTS
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_data.classes),
+    y=train_data.classes
+)
+class_weights = dict(enumerate(class_weights))
+print("Class weights:", class_weights)
+
+# MODEL
+base_model = EfficientNetB2(
+    weights='imagenet',
+    include_top=False,
+    input_shape=(260,260,3)
+)
+
+base_model.trainable = False
+
+x = base_model.output
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dense(512, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+output = layers.Dense(1, activation='sigmoid')(x)
+
+model = models.Model(inputs=base_model.input, outputs=output)
+
+# COMPILE
+optimizer = tf.keras.optimizers.Adam(
+    learning_rate=1e-4,
+    beta_1=0.9,
+    beta_2=0.999,
+    clipnorm=1.0
+)
+
+model.compile(
+    optimizer=optimizer,
+    loss='binary_crossentropy',
+    metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+)
+
+# CALLBACKS
+callbacks = [
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_auc',
+        factor=0.5,
+        patience=3,
+        min_lr=1e-7,
+        verbose=1
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_auc',
+        patience=7,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ModelCheckpoint(
+        "best_model.h5",
+        monitor='val_auc',
+        save_best_only=True,
+        verbose=1
+    )
+]
+
+
+
+# TRAINING PHASE 1 (FROZEN)
+history = model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=50, # Changed from 1 to 50
+    class_weight=class_weights, # <-- use manual weights here
+    callbacks=callbacks
+)
+# TRAINING PHASE 2 (UNFREEZE)
+base_model.trainable = True
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-5),
+    loss='binary_crossentropy',
+    metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+)
+
+history = model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=50, # Changed from 1 to 50
+    class_weight=class_weights,
+    callbacks=callbacks
+)
+
+# SAVE MODEL
+model.save("test_model.h5")
+from google.colab import files
+files.download("test_model.h5")
+
+# IMPORTS (START MODEL 2/EHR)
+import pandas as pd
+import os
+import shutil
+from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import EfficientNetB2
+from tensorflow.keras import layers, models
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
+from datasets import load_dataset # Added for HuggingFace dataset
+from PIL import Image # Added for saving HuggingFace images
+
+# PATHS
+RAW_IMAGE_DIR_1 = "/content/MILK10k_Training_Input/"  # folder with your images for first dataset
+DIAG_CSV_1 = "/content/drive/MyDrive/SKNCCR/MILK10k_Training_Supplement.csv"  # diagnosis CSV for first dataset
+OUTPUT_PATH = "/content/milk10k_cancer_binary/"
+NEW_DATASET_DIR = "/content/africa_skin_cancer/" # Directory for the new dataset
+
+# BUILD IMAGE PATH MAPPING - Dataset 1
+image_id_to_path_1 = {}
+print("Building image path mapping for Dataset 1...")
+for root, _, files in os.walk(RAW_IMAGE_DIR_1):
+    for file in files:
+        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            isic_id = os.path.splitext(file)[0]
+            image_id_to_path_1[isic_id] = os.path.join(root, file)
+print(f"Found {len(image_id_to_path_1)} images in Dataset 1.")
+
+# LOAD CSV - Dataset 1
+df1 = pd.read_csv(DIAG_CSV_1)
+print("Columns for Dataset 1:", df1.columns.tolist())
+# Filter only images we actually have for Dataset 1
+df1 = df1[df1['isic_id'].isin(image_id_to_path_1.keys())].copy()
+print(f"Filtered DataFrame size for Dataset 1 after matching images: {len(df1)}")
+
+# LOAD AND PROCESS DATASET 2 (Hugging Face EHR)
+print("Loading and processing Dataset 2 from Hugging Face...")
+# Create a directory to store images from the new dataset
+os.makedirs(NEW_DATASET_DIR, exist_ok=True)
+
+# Load the dataset from Hugging Face
+dataset = load_dataset("electricsheepafrica/Africa-skin-cancer-images-EHR")
+
+# Convert to pandas DataFrame for easier processing
+df2_list = []
+image_id_to_path_2 = {}
+for i, item in enumerate(tqdm(dataset['train'])):
+    # Assuming the image is directly accessible via 'image' feature
+    # and diagnosis is in 'meta' -> 'lesion_type_diagnosis'
+    img = item['image']
+    diagnosis_raw = item['meta']['lesion_type_diagnosis']
+    img_id = f"africa_img_{i:05d}" # Create a unique ID for each image
+
+    # Save the image locally
+    img_path = os.path.join(NEW_DATASET_DIR, f"{img_id}.jpg")
+    img.save(img_path)
+
+    image_id_to_path_2[img_id] = img_path
+    df2_list.append({"isic_id": img_id, "diagnosis_full": diagnosis_raw})
+
+df2 = pd.DataFrame(df2_list)
+print(f"Found {len(image_id_to_path_2)} images in Dataset 2.")
+print("Columns for Dataset 2:", df2.columns.tolist())
+print(df2.head())
+
+
+# COMBINE DATASETS
+# Ensure consistent column names before concatenation
+df1_renamed = df1[['isic_id', 'diagnosis_full']].copy()
+df_combined = pd.concat([df1_renamed, df2[['isic_id', 'diagnosis_full']]], ignore_index=True)
+image_id_to_path = {**image_id_to_path_1, **image_id_to_path_2} # Merge dictionaries
+
+print(f"Combined DataFrame size: {len(df_combined)}")
+print(f"Combined image path mapping size: {len(image_id_to_path)}")
+
+# MAP LABELS
+def map_label(row):
+    diagnosis = str(row["diagnosis_full"]).lower()
+    # Terms for Dataset 1
+    cancer_terms_1 = ["melanoma", "squamous cell carcinoma", "basal cell carcinoma",
+                      "actinic keratosis", "keratoacanthoma", "atypical fibroxanthoma",
+                      "kaposi sarcoma", "malignant peripheral nerve sheath tumor",
+                      "merkel cell carcinoma"]
+
+    # Terms for Dataset 2 (mel, bcc, akiec)
+    cancer_terms_2 = ["mel", "bcc", "akiec"]
+
+    if any(term in diagnosis for term in cancer_terms_1) or \
+       any(term in diagnosis for term in cancer_terms_2):
+        return "cancer"
+    else:
+        return "non_cancer"
+
+df_combined['label'] = df_combined.apply(map_label, axis=1) # Assign the labels to a new 'label' column
+print("Labels mapped.")
+print(df_combined['label'].value_counts()) # To see distribution
+
+# CREATE FOLDER STRUCTURE 
+for c in ["cancer", "non_cancer"]:
+    os.makedirs(os.path.join(OUTPUT_PATH, c), exist_ok=True)
+
+# COPY IMAGES TO FOLDER
+print("Copying images to structured folders...")
+# Clear the existing output path to avoid duplication if running multiple times
+if os.path.exists(OUTPUT_PATH):
+    shutil.rmtree(OUTPUT_PATH)
+for c in ["cancer", "non_cancer"]:
+    os.makedirs(os.path.join(OUTPUT_PATH, c), exist_ok=True)
+
+for _, row in tqdm(df_combined.iterrows(), total=len(df_combined)):
+    img_id = row["isic_id"]
+    label = row["label"]
+    src = image_id_to_path[img_id] # Use the combined mapping for source path
+    dst = os.path.join(OUTPUT_PATH, label, img_id + ".jpg")
+    shutil.copy(src, dst)
+print("Image copying complete.")
+
+# Verify
+for root, dirs, files in os.walk(OUTPUT_PATH):
+    print(f"Folder: {os.path.basename(root)}, Images: {len(files)}")
+
+# DATA GENERATORS 
+train_gen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,
+    horizontal_flip=True,
+    vertical_flip=True
+)
+
+train_data = train_gen.flow_from_directory(
+    OUTPUT_PATH,
+    target_size=(260,260),
+    batch_size=32,
+    class_mode='binary',
+    subset='training'
+)
+
+val_data = train_gen.flow_from_directory(
+    OUTPUT_PATH,
+    target_size=(260,260),
+    batch_size=32,
+    class_mode='binary',
+    subset='validation'
+)
+
+# CLASS WEIGHTS
+# Recompute class weights based on the combined dataset
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_data.classes),
+    y=train_data.classes
+)
+class_weights = dict(enumerate(class_weights))
+print("Class weights:", class_weights)
+
+# MODEL 
+base_model = EfficientNetB2(
+    weights='imagenet',
+    include_top=False,
+    input_shape=(260,260,3)
+)
+
+base_model.trainable = False
+
+x = base_model.output
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dense(512, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+output = layers.Dense(1, activation='sigmoid')(x)
+
+model = models.Model(inputs=base_model.input, outputs=output)
+
+# COMPILE 
+optimizer = tf.keras.optimizers.Adam(
+    learning_rate=1e-4,
+    beta_1=0.9,
+    beta_2=0.999,
+    clipnorm=1.0
+)
+
+model.compile(
+    optimizer=optimizer,
+    loss='binary_crossentropy',
+    metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+)
+
+# CALLBACKS 
+callbacks = [
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_auc',
+        factor=0.5,
+        patience=3,
+        min_lr=1e-7,
+        verbose=1
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_auc',
+        patience=7,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ModelCheckpoint(
+        "best_model.h5",
+        monitor='val_auc',
+        save_best_only=True,
+        verbose=1
+    )
+]
+
+
+
+# TRAINING PHASE 1 (FROZEN)
+history = model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=50, # Changed from 1 to 50
+    class_weight=class_weights, # <-- use manual weights here
+    callbacks=callbacks
+)
+# TRAINING PHASE 2 (UNFREEZE)
+base_model.trainable = True
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-5),
+    loss='binary_crossentropy',
+    metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+)
+
+history = model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=50, # Changed from 1 to 50
+    class_weight=class_weights,
+    callbacks=callbacks
+)
+
+# SAVE MODEL
+model.save("ehrmodel.h5")
+from google.colab import files
+files.download("ehrmodel.h5")
+
+import tensorflow as tf
+from tensorflow.keras.preprocessing import image
+import numpy as np
+import os
+from PIL import Image
+
+# Load the saved model
+model = tf.keras.models.load_model('test_model.h5')
+print("Model loaded successfully!")
+
+# TEST SAMPLE IMAGE
+OUTPUT_PATH = "/content/milk10k_cancer_binary/"
+
+# Get a sample image path (e.g., from the 'cancer' class)
+cancer_dir = os.path.join(OUTPUT_PATH, 'cancer')
+sample_image_name = os.listdir(cancer_dir)[0] # Take the first image
+sample_image_path = os.path.join(cancer_dir, sample_image_name)
+
+print(f"Selected sample image: {sample_image_path}")
+
+# Load and preprocess the image
+img = Image.open(sample_image_path)
+img = img.resize((260, 260)) # Resize to target size used during training
+img_array = image.img_to_array(img)
+img_array = np.expand_dims(img_array, axis=0) # Create a batch
+img_array /= 255.0 # Rescale the image like during training
+
+print(f"Preprocessed image shape: {img_array.shape}")
+
+import matplotlib.pyplot as plt
+
+# Plot training & validation accuracy values
+plt.figure(figsize=(12, 6))
+plt.scatter(range(len(history.history['accuracy'])), history.history['accuracy'], label='Train')
+plt.scatter(range(len(history.history['val_accuracy'])), history.history['val_accuracy'], label='Validation')
+plt.title('Model Accuracy')
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+plt.legend(loc='upper left')
+plt.xticks(range(len(history.history['accuracy'])), [f'Epoch {i+1}' for i in range(len(history.history['accuracy']))])
+plt.grid(True)
+plt.show()
+
+# Plot training & validation AUC values
+plt.figure(figsize=(12, 6))
+plt.scatter(range(len(history.history['auc'])), history.history['auc'], label='Train')
+plt.scatter(range(len(history.history['val_auc'])), history.history['val_auc'], label='Validation')
+plt.title('Model AUC')
+plt.ylabel('AUC')
+plt.xlabel('Epoch')
+plt.legend(loc='upper left')
+plt.xticks(range(len(history.history['auc'])), [f'Epoch {i+1}' for i in range(len(history.history['auc']))])
+plt.grid(True)
+plt.show()
+
+# Make prediction
+prediction = model.predict(img_array)
+
+# Interpret prediction (for binary classification with sigmoid)
+threshold = 0.5
+if prediction[0][0] > threshold:
+    predicted_class = 'cancer'
+    probability = prediction[0][0]
+else:
+    predicted_class = 'non_cancer'
+    probability = 1 - prediction[0][0] # Probability of being non_cancer
+
+print(f"Prediction for {sample_image_name}: {predicted_class} with probability {probability:.4f}")
+
+# Display the image for visual verification
+import matplotlib.pyplot as plt
+plt.imshow(img)
+plt.title(f"Predicted: {predicted_class} ({probability:.2f})")
+plt.axis('off')
+plt.show()
+
