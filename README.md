@@ -1,4 +1,4 @@
-# Spring26Group2Project
+# Spring 2026 Group Project - Group 2
 # Utilizing diverse datasets to improve the efficacy of AI in detection of skin cancer
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
